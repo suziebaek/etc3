@@ -13,13 +13,12 @@ def parse_reading_docx(file):
     questions = []
     current_q = None
     
-    # 더 유연한 정규식으로 선지 및 번호 매칭율 상향
-    q_pattern = re.compile(r'^(\d+)\.?\s*(.*)')  
-    opt_pattern = re.compile(r'^([①②③④⑤\d])\s*(.*)') 
+    q_pattern = re.compile(r'^(\d+)\.?\s*(.*)')  # 문제 번호 (예: 1. 다음 글의)
+    opt_pattern = re.compile(r'^([①②③④⑤])\s*(.*)') # 선택지 (예: ① 대회 일정을)
     
     all_elements = []
     
-    # 1차 순회: 본문 및 표 요소를 순서대로 정렬 수집
+    # 1차 순회: 최상위 body 기준 문단과 표(지문 박스)를 순서대로 수집 (이중 파싱 방지)
     for element in doc.element.body:
         if element.getparent() != doc.element.body:
             continue
@@ -37,7 +36,7 @@ def parse_reading_docx(file):
             if txt:
                 all_elements.append({"type": "text", "text": txt})
                 
-        elif element.tag.endswith('tbl'):  # 표/상자 요소
+        elif element.tag.endswith('tbl'):  # 📦 표 (19번 이후의 박스형 지문)
             t = docx.table.Table(element, doc)
             table_lines = []
             for row in t.rows:
@@ -55,24 +54,20 @@ def parse_reading_docx(file):
             if table_lines:
                 all_elements.append({"type": "table", "lines": table_lines})
 
-    # 2차 순회: 수정된 번호별 분기 조건 가공
+    # 2차 순회: 수능 독해 레이아웃 규칙에 맞춰 그룹화
     for item in all_elements:
+        # [A] 박스형 지문(표)을 만났을 때 처리
         if item["type"] == "table":
             if current_q is not None:
-                q_num_int = int(current_q["num"]) if current_q["num"].isdigit() else 1
                 for t_line in item["lines"]:
-                    # 밑줄 서식 교정 규칙 적용
-                    converted_t_line = re.sub(r'_{2,}', '<span class="underline" style="width: 120px; display: inline-block; border-bottom: 1px solid #000;"></span>', t_line)
-                    
-                    if 19 <= q_num_int <= 22:
-                        current_q["box_sentence"].append(converted_t_line)
-                    else:
-                        current_q["passage_lines"].append(converted_t_line)
+                    # 밑줄 공백 표현 변환
+                    converted_t_line = re.sub(r'_{2,}', '<span class="underline" style="width:100px;"></span>', t_line)
+                    current_q["passage_lines"].append(converted_t_line)
             continue
 
         line = item["text"].strip()
 
-        # 새로운 문제 번호 등장 감지
+        # [B] 새로운 문제 번호 등장 시 마감 및 새 방 개설
         q_match = q_pattern.match(line)
         if q_match:
             if current_q is not None:
@@ -80,8 +75,7 @@ def parse_reading_docx(file):
             current_q = {
                 "num": q_match.group(1),
                 "title": q_match.group(2),
-                "passage_lines": [], 
-                "box_sentence": [],  
+                "passage_lines": [],  # <div class="passage"> 내부의 <p class="dialog">로 들어갈 지문들
                 "options": []
             }
             continue
@@ -89,30 +83,34 @@ def parse_reading_docx(file):
         if current_q is None:
             continue
 
+        # 교사용 정답 및 해설 라인 패스
         if line.startswith("정답:") or "→" in line:
             continue
+            
+        # 대괄호로 묶인 문제 번호 안내선 패스 (예: [26~28])
         if line.startswith("[") and "]" in line:
             continue
 
-        # 선택지 보기(①~⑤) 매칭 처리 (선지 유실 방지 디펜스)
+        # [C] 선택지 보기(①~⑤)를 만났을 때
         opt_match = opt_pattern.match(line)
-        if opt_match and any(char in line[:3] for char in ["①", "②", "③", "④", "⑤"]):
-            # 맨 앞 글자 추출 및 숫자 매핑
-            char = line[0]
-            label_map = {"①": "1", "②": "2", "③": "3", "④": "4", "⑤": "5"}
-            num = label_map.get(char, "1")
-            opt_text = line[1:].strip()
+        if opt_match:
+            label_char = opt_match.group(1)
+            opt_text = opt_match.group(2)
             
+            label_map = {"①": "1", "②": "2", "③": "3", "④": "4", "⑤": "5"}
+            label_num = label_map.get(label_char, "1")
+            
+            # 보기 내부 연속 공백 정렬 복원
             processed_opt = re.sub(r'\s{2,}', ' &nbsp;&nbsp;&nbsp;&nbsp; ', opt_text)
             current_q["options"].append({
-                "char": char,
-                "num": num,
+                "char": label_char,
+                "num": label_num,
                 "text": processed_opt
             })
             continue
 
-        # 일반 지문 영역 및 밑줄 태그 치환 규칙 적용
-        converted_line = re.sub(r'_{2,}', '<span class="underline" style="width: 120px; display: inline-block; border-bottom: 1px solid #000;"></span>', line)
+        # [D] 선지 전이나 사이에 있는 모든 지문/단어 주석은 p class="dialog"로 흡수
+        converted_line = re.sub(r'_{2,}', '<span class="underline" style="width:100px;"></span>', line)
         current_q["passage_lines"].append(converted_line)
 
     if current_q is not None:
@@ -122,12 +120,10 @@ def parse_reading_docx(file):
 
 
 # ==========================================
-# [기능 2] 번호대별 스킨 분기형 HTML 렌더러
+# [기능 2] 수능 독해 규격 맞춤형 단일 HTML 생성
 # ==========================================
-def generate_split_reading_html(q):
-    q_num_int = int(q["num"]) if q["num"].isdigit() else 1
-
-    # 공통 상단 헤더
+def generate_reading_html(q):
+    # 제공해주신 수능 독해 표준 스킨 템플릿 선언
     html_content = """<!DOCTYPE html>
 <html>
 <head>
@@ -136,7 +132,7 @@ def generate_split_reading_html(q):
 <meta charset="UTF-8" name="viewport" content="width=device-width, target-densitydpi=device-dpi" />
 <meta HTTP-EQUIV="CACHE-CONTROL" CONTENT="NO-CACHE">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no,minimum-scale=1.0,maximum-scale=1.0,target-densitydpi=device-dpi">
-<title>Achievement Test</title>
+<title>Online Achievement Test</title>
 <link rel="stylesheet" href="../../../common/css/common.css">
 <link rel="stylesheet" href="../../../common/css/style.css">
 <link rel="stylesheet" href="../../../common_ex/css/style.css">
@@ -146,117 +142,51 @@ def generate_split_reading_html(q):
 <script type="text/javascript" charset="UTF-8" src="../../../common_ex/js/common.js"></script>
 </head>
 <body>
-\t<div class="pageWrap">
-\t\t<div id="R_question" class="STSection">
-\t\t\t<div class="desc_box"><b>Questions 1-28</b> 지문을 읽고 문제를 풀이하시오.</div>
-\t\t\t<div class="pageConts">
+<div class="pageWrap">
+\t<div class="listening_desc_box"><b>Reading Comprehension</b> 질문을 읽고 물음에 답하시오.</div>
+\t<div id="R_question" class="STSection">
+\t\t<div class="pageConts">
 """
 
+    # 지시문 내 밑줄 태그가 깨지지 않도록 안전 변환 및 복원
     safe_title = html.escape(q['title'])
     safe_title = safe_title.replace("&lt;u&gt;", "<u>").replace("&lt;/u&gt;", "</u>")
 
-    # ------------------------------------------
-    # 유형 1: 1번 ~ 18번 구조 (14~17번 포함 스타일 정형화 완료)
-    # ------------------------------------------
-    if q_num_int <= 18:
-        # prompt1 영역 생성
-        html_content += "\t\t\t\t<div class=\"prompt1\">\n\t\t\t\t\t<div class=\"passage\">\n"
-        for p_line in q["passage_lines"]:
-            if p_line.startswith("Dear") or p_line.startswith("Sincerely"):
-                html_content += f"\t\t\t\t\t\t<p class=\"dialog\">{p_line}</p>\n"
-            elif p_line.startswith("*"):
-                html_content += f"\t\t\t\t\t\t<p class=\"footnote right\">{p_line}</p>\n"
-            else:
-                html_content += f"\t\t\t\t\t\t<p class=\"indent\">{p_line}</p>\n"
-        html_content += "\t\t\t\t\t</div>\n\t\t\t\t</div>\n"
-
-        # prompt2 영역 생성
-        html_content += f"""\t\t\t\t<div class="prompt2">
-\t\t\t\t\t<div class="q_box">
-\t\t\t\t\t\t<table class="answer_txt STChooseAnAnswer L_tableQuestion" scale="190" answer=\"3\" gravity=\"top|left\">
-\t\t\t\t\t\t\t<tr>
-\t\t\t\t\t\t\t\t<td><span class="num STCorrectness">{q['num']}.</span></td>
-\t\t\t\t\t\t\t\t<td>{safe_title} <br></td>
-\t\t\t\t\t\t\t</tr>\n"""
+    # 상단 문제 및 지시문 배치
+    html_content += f"""\t\t\t<div class="q_box">
+\t\t\t\t<table class="answer_txt STChooseAnAnswer L_tableQuestion" scale="190" answer="3" gravity="top|left">
+\t\t\t\t\t<tr>
+\t\t\t\t\t\t<td><span class="num STCorrectness">{q['num']}.</span></td>
+\t\t\t\t\t\t<td>{safe_title} <br></td>
+\t\t\t\t\t</tr>\n"""
+    
+    # 💡 [핵심 요청 구현] 지문 영역을 <div class="passage">로 감싸고, 각 문단을 <p class="dialog">로 처리
+    if q["passage_lines"]:
+        html_content += """\t\t\t\t\t<tr>
+\t\t\t\t\t\t<td></td>
+\t\t\t\t\t\t<td>
+\t\t\t\t\t\t\t<div class="passage">\n"""
         
-        # 선지 마크업 주입
-        for opt in q["options"]:
-            html_content += f"""\t\t\t\t\t\t\t<tr>
-\t\t\t\t\t\t\t\t<td></td>
-\t\t\t\t\t\t\t\t<td><span class="STChoice" remarkable="true" label="{opt['num']}"><span class="label">{opt['char']}</span> {opt['text']}</span></td>
-\t\t\t\t\t\t\t</tr>\n"""
-        html_content += "\t\t\t\t\t\t</table>\n\t\t\t\t\t</div>\n\t\t\t\t</div>\n"
-
-    # ------------------------------------------
-    # 유형 2: 19번 ~ 22번 구조 (colspan="5" 및 sentence 적용 구역)
-    # ------------------------------------------
-    elif 19 <= q_num_int <= 22:
-        # prompt1 구역 처리
-        html_content += "\t\t\t\t<div class=\"prompt1\">\n\t\t\t\t\t<div class=\"passage\">\n"
         for p_line in q["passage_lines"]:
-            if p_line.startswith("*"):
-                html_content += f"\t\t\t\t\t\t<p class=\"footnote right\">{p_line}</p>\n"
-            else:
-                html_content += f"\t\t\t\t\t\t<p class=\"indent\">{p_line}</p>\n"
-        html_content += "\t\t\t\t\t</div>\n\t\t\t\t</div>\n"
-
-        # prompt2 내부 구성
-        html_content += f"""\t\t\t\t<div class="prompt2">
-\t\t\t\t\t<div class="q_box">
-\t\t\t\t\t\t<table class="answer_txt STChooseAnAnswer L_tableQuestion" scale="190" answer="4" gravity="top|left">
-\t\t\t\t\t\t\t<tr>
-\t\t\t\t\t\t\t\t<td><span class="num STCorrectness">{q['num']}.</span></td>
-\t\t\t\t\t\t\t\t<td>{safe_title}<br></td>
-\t\t\t\t\t\t\t</tr>\n"""
+            html_content += f"\t\t\t\t\t\t\t\t<p class=\"dialog\">{p_line}</p>\n"
+            
+        html_content += """\t\t\t\t\t\t\t</div>
+\t\t\t\t\t\t</td>
+\t\t\t\t\t</tr>\n"""
         
-        if q["box_sentence"]:
-            box_join = " ".join(q["box_sentence"])
-            html_content += f"""\t\t\t\t\t\t\t<tr>
-\t\t\t\t\t\t\t\t<td colspan="5">
-\t\t\t\t\t\t\t\t\t<div class="sentence">{box_join}</div>
-\t\t\t\t\t\t\t\t</td>
-\t\t\t\t\t\t\t</tr>\n"""
+    # 하단 선택지(①~⑤) 테이블 형태로 정렬 배치
+    for opt in q["options"]:
+        html_content += f"""\t\t\t\t\t<tr>
+\t\t\t\t\t\t<td></td>
+\t\t\t\t\t\t<td><span class="STChoice" remarkable="true" label="{opt['num']}"><span class="label">{opt['char']}</span> {opt['text']} </span></td>
+\t\t\t\t\t</tr>\n"""
+        
+    html_content += """\t\t</table>
+\t\t\t</div>\n"""
 
-        for opt in q["options"]:
-            html_content += f"""\t\t\t\t\t\t\t<tr>
-\t\t\t\t\t\t\t\t<td></td>
-\t\t\t\t\t\t\t\t<td><span class="STChoice" remarkable="true" label="{opt['num']}"><span class="label">{opt['char']}</span> {opt['text']}</span></td>
-\t\t\t\t\t\t\t</tr>\n"""
-        html_content += "\t\t\t\t\t\t</table>\n\t\t\t\t\t</div>\n\t\t\t\t</div>\n"
-
-    # ------------------------------------------
-    # 유형 3: 23번 ~ 마지막 번호 구조 (영어 지문 강제 인식 및 문단별 indent 구성)
-    # ------------------------------------------
-    else:
-        # prompt1 : 모든 영어 지문을 문단별로 <p class="indent"> 래핑
-        html_content += "\t\t\t\t<div class=\"prompt1\">\n\t\t\t\t\t<div class=\"passage\">\n"
-        for p_line in q["passage_lines"]:
-            if p_line.startswith("*"):
-                html_content += f"\t\t\t\t\t\t<p class=\"footnote right\">{p_line}</p>\n"
-            else:
-                html_content += f"\t\t\t\t\t\t<p class=\"indent\">{p_line}</p>\n"
-        html_content += "\t\t\t\t\t</div>\n\t\t\t\t</div>\n"
-
-        # prompt2 빌드
-        html_content += f"""\t\t\t\t<div class="prompt2">
-\t\t\t\t\t<div class="q_box">
-\t\t\t\t\t\t<table class="answer_txt STChooseAnAnswer L_tableQuestion" scale="190" answer="4" gravity="top|left">
-\t\t\t\t\t\t\t<tr>
-\t\t\t\t\t\t\t\t<td><span class="num STCorrectness">{q['num']}.</span></td>
-\t\t\t\t\t\t\t\t<td>{safe_title}<br></td>
-\t\t\t\t\t\t\t</tr>\n"""
-
-        for opt in q["options"]:
-            html_content += f"""\t\t\t\t\t\t\t<tr>
-\t\t\t\t\t\t\t\t<td></td>
-\t\t\t\t\t\t\t\t<td><span class="STChoice" remarkable="true" label="{opt['num']}"><span class="label">{opt['char']}</span> {opt['text']}</span></td>
-\t\t\t\t\t\t\t</tr>\n"""
-        html_content += "\t\t\t\t\t\t</table>\n\t\t\t\t\t</div>\n\t\t\t\t</div>\n"
-
-    # 공통 푸터 하단 마감
-    html_content += """\t\t\t</div>
-\t\t</div>
+    html_content += """\t\t</div>
 \t</div>
+</div>
 </body>
 </html>"""
 
@@ -264,19 +194,30 @@ def generate_split_reading_html(q):
 
 
 # ==========================================
-# [기능 3] Streamlit 레이아웃 연동부
+# [기능 3] Streamlit 웹 화면 레이아웃 및 다운로드 제어
 # ==========================================
-st.set_page_config(page_title="수능 독해형 완전 자동화 패키저", layout="wide")
 
-st.title("🚀 수능형 독해 마크업 정밀 교정 시스템")
-st.caption("요청하신 밑줄 서식 매칭, 선지 누락 디펜스, 14~17번 스킨 통일, 19번 이후 문단별 indent 구현이 적용된 버전입니다.")
+st.set_page_config(page_title="수능 독해형 자동 HTML 추출 시스템", layout="wide")
 
-uploaded_file = st.file_uploader("수능 독해형 워드 문서(.docx)를 업로드하세요", type=["docx"])
-submit_button = st.button("🎁 수정사항 반영된 압축 패키지 일괄 생성", type="primary")
+with st.sidebar:
+    st.header("⚙️ 독해 고정값 설정")
+    st.text_input("service_code", value="SVC170")
+    st.text_input("track_code", value="RSV_TRK01")
+    st.text_input("top_cors_id", value="1879")
+    st.text_input("level_code", value="TO_R_E_SP")
+    st.text_input("component_code", value="COM170")
+    st.text_input("book_code", value="SVC170")
+    st.text_input("act_name", value="Reading")
+
+st.title("📚 수능형 독해 자동 HTML 추출 시스템")
+st.caption("수능 독해 정기평가 워드 문서를 업로드하면 일반 지문 및 박스형 지문을 정밀하게 감지하여 규격화된 HTML 패키지로 분할 생성합니다.")
+
+uploaded_file = st.file_uploader("독해 워드 파일(.docx)을 업로드하세요", type=["docx"])
+submit_button = st.button("🚀 독해 문항 폴더 구조로 분할 변환하기", type="primary")
 
 if uploaded_file is not None and submit_button:
     try:
-        with st.spinner("요청 피드백 반영 및 압축 패키징 중..."):
+        with st.spinner("수능형 지문 구조 파악 및 선지 전 dialog 변환 작업을 진행 중입니다..."):
             parsed_data = parse_reading_docx(uploaded_file)
             
             zip_buffer = io.BytesIO()
@@ -286,21 +227,22 @@ if uploaded_file is not None and submit_button:
                     if not q_num:
                         continue
                     
-                    single_html = generate_split_reading_html(q)
+                    single_html = generate_reading_html(q)
                     folder_file_path = f"{q_num}/test.html"
                     zip_file.writestr(folder_file_path, single_html)
             
             zip_data = zip_buffer.getvalue()
             
-        st.success(f"🎉 성공! 총 {len(parsed_data)}문항의 수능 독해 전용 완결형 패키지가 완성되었습니다.")
+        st.success(f"🎉 변환 완료! 총 {len(parsed_data)}개의 수능 독해 문항 지문과 선지를 성공적으로 연동했습니다.")
         
-        st.subheader("📂 완료된 ZIP 파일 다운로드")
+        st.subheader("📂 독해 패키지 다운로드")
         st.download_button(
-            label="📥 피드백 반영 통합 ZIP 다운로드",
+            label="📥 독해 번호별 폴더 압축파일(.zip) 다운로드",
             data=zip_data,
-            file_name="perfect_reading_test_package.zip",
+            file_name="reading_questions_folders.zip",
             mime="application/zip"
         )
+        st.info(f"💡 일반 지문 및 19번 이후 박스 지문 모두 <div class='passage'> 하위의 <p class='dialog'> 구조로 완벽 가공되었습니다.")
             
     except Exception as e:
-        st.error(f"⚠️ 처리 중 알 수 없는 예외 오류 발생: {e}")
+        st.error(f"⚠️ 독해 변환 시스템 처리 중 예외 발생: {e}")
